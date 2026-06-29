@@ -1,0 +1,20 @@
+[package]
+name = "ssft"
+version = "0.1.0"
+edition = "2021"
+description = "Sift through Claude Code sessions, ncdu-style"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "serde"] }
+# `bundled` compiles SQLite from source so the binary has no system dependency -
+# required for the SQLite-backed providers (Crush, and later Cursor/Goose).
+rusqlite = { version = "0.32", features = ["bundled"] }
+# TUI. ratatui re-exports its matching crossterm, so we depend on it via
+# `ratatui::crossterm` rather than pinning crossterm separately.
+ratatui = "0.29"
+
+[profile.release]
+opt-level = 3
+lto = true

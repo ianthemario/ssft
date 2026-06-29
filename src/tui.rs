@@ -267,6 +267,9 @@ pub struct App {
     transcript_for: Option<usize>,
     transcript_lines: Vec<Line<'static>>,
     transcript_scroll: u16,
+    /// Body height of the transcript view, captured during draw so the key
+    /// handler can page and clamp against the real viewport.
+    transcript_viewport: u16,
 
     should_quit: bool,
 }
@@ -294,6 +297,7 @@ impl App {
             transcript_for: None,
             transcript_lines: Vec::new(),
             transcript_scroll: 0,
+            transcript_viewport: 0,
             should_quit: false,
         };
         app.recompute_view();
@@ -570,16 +574,22 @@ impl App {
     }
 
     fn handle_transcript_key(&mut self, key: KeyEvent) {
-        let max = self.transcript_lines.len().saturating_sub(1) as u16;
+        let total = self.transcript_lines.len();
+        let viewport = self.transcript_viewport.max(1) as usize;
+        // Hard ceiling keeps the last line reachable at the top (so a wrapped
+        // final screen can't hide it); `g`/`G` snap to a full first/last screen.
+        let hard_max = total.saturating_sub(1) as u16;
+        let full_last = total.saturating_sub(viewport) as u16;
+        let page = viewport.saturating_sub(2).max(1) as u16;
         match key.code {
             // Back up to Detail (q here is "up a level", not quit).
             KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left => self.mode = Mode::Detail,
-            KeyCode::Down | KeyCode::Char('j') => self.transcript_scroll = self.transcript_scroll.saturating_add(1).min(max),
+            KeyCode::Down | KeyCode::Char('j') => self.transcript_scroll = self.transcript_scroll.saturating_add(1).min(hard_max),
             KeyCode::Up | KeyCode::Char('k') => self.transcript_scroll = self.transcript_scroll.saturating_sub(1),
-            KeyCode::PageDown => self.transcript_scroll = self.transcript_scroll.saturating_add(20).min(max),
-            KeyCode::PageUp => self.transcript_scroll = self.transcript_scroll.saturating_sub(20),
+            KeyCode::PageDown => self.transcript_scroll = self.transcript_scroll.saturating_add(page).min(hard_max),
+            KeyCode::PageUp => self.transcript_scroll = self.transcript_scroll.saturating_sub(page),
             KeyCode::Home | KeyCode::Char('g') => self.transcript_scroll = 0,
-            KeyCode::End | KeyCode::Char('G') => self.transcript_scroll = max,
+            KeyCode::End | KeyCode::Char('G') => self.transcript_scroll = full_last,
             _ => {}
         }
     }
@@ -847,26 +857,47 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
     );
 }
 
-/// Maximum transcript lines rendered; very long sessions are capped with a
-/// notice rather than building an unbounded Paragraph.
-const TRANSCRIPT_LINE_CAP: usize = 4000;
+/// Visible `[start, end)` slice of transcript lines for a given scroll offset,
+/// viewport height, and total line count. Windowing the slice keeps per-frame
+/// work proportional to the viewport, not the whole (uncapped) transcript.
+fn transcript_window(scroll: usize, viewport: usize, total: usize) -> (usize, usize) {
+    if total == 0 || viewport == 0 {
+        return (0, 0);
+    }
+    let start = scroll.min(total - 1);
+    let end = (start + viewport).min(total);
+    (start, end)
+}
 
 fn draw_transcript(frame: &mut Frame, app: &mut App) {
     let [body, footer] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(frame.area());
 
+    // Body height inside the borders is the viewport; record it for paging.
+    let viewport = body.height.saturating_sub(2) as usize;
+    app.transcript_viewport = viewport as u16;
+
+    let total = app.transcript_lines.len();
+    let (start, end) = transcript_window(app.transcript_scroll as usize, viewport, total);
+    app.transcript_scroll = start as u16; // reconcile state with the clamp
+    // Clone only the visible window, never the whole transcript.
+    let visible: Vec<Line> = app.transcript_lines[start..end].to_vec();
+
     let s = &app.all[app.detail_index];
     let title = s.display_title().unwrap_or("(unnamed)").to_string();
+    let pos = if total == 0 {
+        "empty".to_string()
+    } else {
+        format!("{}-{} / {}", start + 1, end, total)
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled(
-            format!(" transcript · {} ", ellipsize(&title, 54)),
+            format!(" transcript · {} ", ellipsize(&title, 48)),
             Style::default().fg(COLOR_ACCENT).bold(),
-        ));
-    let para = Paragraph::new(app.transcript_lines.clone())
-        .block(block)
-        .wrap(Wrap { trim: false })
-        .scroll((app.transcript_scroll, 0));
+        ))
+        .title_bottom(Line::from(Span::styled(format!(" {pos} "), Style::default().fg(Color::DarkGray))).right_aligned());
+    let para = Paragraph::new(visible).block(block).wrap(Wrap { trim: false });
     frame.render_widget(para, body);
 
     frame.render_widget(
@@ -877,21 +908,13 @@ fn draw_transcript(frame: &mut Frame, app: &mut App) {
 
 /// Build the displayable transcript: a role-headed, block-by-block rendering.
 /// Reasoning and tool payloads are abbreviated so the conversation stays
-/// skimmable; full prose text is kept and wrapped by the Paragraph.
+/// skimmable; full prose text is kept and wrapped by the Paragraph. The full
+/// set is built once and cached; `draw_transcript` windows it, so there is no
+/// length cap.
 fn render_transcript(messages: &[Message]) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
 
     for m in messages {
-        if out.len() >= TRANSCRIPT_LINE_CAP {
-            let remaining = messages.len();
-            out.push(Line::from(""));
-            out.push(Line::from(Span::styled(
-                format!("… transcript truncated at {TRANSCRIPT_LINE_CAP} lines ({remaining} messages total) …"),
-                Style::default().fg(Color::Yellow),
-            )));
-            break;
-        }
-
         let (marker, color) = match m.role {
             Role::User => ("▌user", Color::Green),
             Role::Assistant => ("▌assistant", COLOR_ACCENT),
@@ -1058,17 +1081,50 @@ mod tests {
     }
 
     #[test]
-    fn transcript_caps_long_sessions() {
-        // Far more text lines than the cap; render must stop and announce it.
-        let msgs: Vec<Message> = (0..5000)
+    fn snapshot_transcript_windowed() {
+        // 40 numbered lines, scrolled to 10, in a short viewport: the frame must
+        // show only the window and the "11-18 / 40"-style position indicator.
+        let mut app = App::new(sample(), vec!["claude-code"]);
+        app.mode = Mode::Transcript;
+        app.detail_index = 0;
+        app.transcript_lines = (0..40).map(|i| Line::from(format!("line {i:02}"))).collect();
+        app.transcript_scroll = 10;
+        let mut term = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let text = to_text(term.backend().buffer());
+        println!("\n===== TRANSCRIPT (windowed) =====\n{text}");
+        // Only windowed lines are present - line 00 (above) and line 39 (below)
+        // are not rendered; the boundary lines and a position indicator are.
+        assert!(text.contains("line 10"), "window start missing");
+        assert!(!text.contains("line 00"), "line above window leaked in");
+        assert!(!text.contains("line 39"), "line below window leaked in");
+        assert!(text.contains("/ 40"), "position indicator missing");
+    }
+
+    #[test]
+    fn transcript_window_bounds() {
+        // Normal slice.
+        assert_eq!(transcript_window(3, 10, 100), (3, 13));
+        // Viewport taller than content.
+        assert_eq!(transcript_window(0, 10, 5), (0, 5));
+        // Scroll past the end clamps so the last line stays reachable.
+        assert_eq!(transcript_window(1000, 10, 50), (49, 50));
+        // Degenerate inputs.
+        assert_eq!(transcript_window(0, 0, 100), (0, 0));
+        assert_eq!(transcript_window(5, 10, 0), (0, 0));
+    }
+
+    #[test]
+    fn transcript_is_not_capped() {
+        // Long session: every message is kept, no truncation notice.
+        let msgs: Vec<Message> = (0..3000)
             .map(|_| Message { role: Role::Assistant, timestamp: None, blocks: vec![MsgBlock::Text("x".into())] })
             .collect();
         let lines = render_transcript(&msgs);
-        // Bounded near the cap (a small per-message overshoot is fine), far
-        // below the ~15000 lines an uncapped render would produce.
-        assert!(lines.len() <= TRANSCRIPT_LINE_CAP + 16, "got {}", lines.len());
         let joined: String = lines.iter().flat_map(|l| l.spans.iter()).map(|s| s.content.as_ref()).collect();
-        assert!(joined.contains("truncated"), "expected truncation notice");
+        assert!(!joined.contains("truncated"), "windowing should remove the cap");
+        // 3000 messages × (blank + header + one text line) = 9000 lines, all kept.
+        assert_eq!(lines.len(), 9000, "got {}", lines.len());
     }
 
     fn to_text(buf: &Buffer) -> String {

@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::model::{Block, Message, Provider, Result, Role, Session, SessionRef, TokenTotals};
+use crate::model::{Block, Message, Provider, ResumeSpec, Result, Role, Session, SessionRef, TokenTotals};
 use crate::providers::{file_size, home, mtime};
 
 pub struct ClaudeCode {
@@ -185,6 +185,16 @@ impl Provider for ClaudeCode {
             }
         }
         Ok(out)
+    }
+
+    fn resume_command(&self, session: &Session) -> Option<ResumeSpec> {
+        // `claude --resume <sessionId>`, run in the session's workspace since
+        // Claude Code scopes sessions by project directory.
+        Some(ResumeSpec {
+            program: "claude".into(),
+            args: vec!["--resume".into(), session.id.clone()],
+            cwd: session.workspace.clone(),
+        })
     }
 }
 
@@ -560,5 +570,15 @@ mod tests {
         // A user turn that is only a tool_result is relabeled Tool.
         assert_eq!(msgs[2].role, Role::Tool);
         assert!(matches!(msgs[2].blocks[0], Block::ToolResult { ref text, is_error: false } if text == "file.txt"));
+    }
+
+    #[test]
+    fn resume_command_builds_claude_invocation() {
+        let mut s = Session::new("claude-code", "abc-123");
+        s.workspace = Some("/home/ian/proj".into());
+        let spec = ClaudeCode::new().resume_command(&s).unwrap();
+        assert_eq!(spec.program, "claude");
+        assert_eq!(spec.args, vec!["--resume".to_string(), "abc-123".to_string()]);
+        assert_eq!(spec.cwd.as_deref(), Some("/home/ian/proj"));
     }
 }

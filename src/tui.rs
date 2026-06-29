@@ -18,7 +18,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
-use crate::model::{Block as MsgBlock, Message, Provider, Role, Session};
+use crate::model::{Block as MsgBlock, Message, Provider, ResumeSpec, Role, Session};
 use crate::util::{ellipsize, human, substance_str};
 
 #[derive(Clone, Copy, PartialEq)]
@@ -271,6 +271,12 @@ pub struct App {
     /// handler can page and clamp against the real viewport.
     transcript_viewport: u16,
 
+    /// Set when the user asks to open a session in its harness; run() execs it
+    /// after the terminal is restored.
+    pending_launch: Option<ResumeSpec>,
+    /// Transient one-line notice shown in the footer (e.g. "not supported").
+    status: Option<String>,
+
     should_quit: bool,
 }
 
@@ -298,6 +304,8 @@ impl App {
             transcript_lines: Vec::new(),
             transcript_scroll: 0,
             transcript_viewport: 0,
+            pending_launch: None,
+            status: None,
             should_quit: false,
         };
         app.recompute_view();
@@ -481,11 +489,40 @@ impl App {
         (cur + delta).clamp(0, len as isize - 1) as usize
     }
 
+    /// Open the session under the cursor in its harness. Determines the target
+    /// per view, asks the provider how to resume it, and either queues the
+    /// launch (handled after the TUI tears down) or reports it's unsupported.
+    fn resume_current(&mut self) {
+        let target = match self.mode {
+            Mode::List => self.view.get(self.selected).copied(),
+            Mode::Browse => match self.browse_entries().get(self.bsel) {
+                Some(Entry::Session(i)) => Some(*i),
+                _ => None, // a directory row is selected, not a session
+            },
+            Mode::Detail | Mode::Transcript => Some(self.detail_index),
+        };
+        let Some(idx) = target else {
+            self.status = Some("select a session first".into());
+            return;
+        };
+        let s = &self.all[idx];
+        let spec = self.providers.iter().find(|p| p.id() == s.provider).and_then(|p| p.resume_command(s));
+        match spec {
+            Some(spec) => {
+                self.pending_launch = Some(spec);
+                self.should_quit = true; // run() execs after restoring the terminal
+            }
+            None => self.status = Some(format!("opening not supported for '{}' yet", s.provider)),
+        }
+    }
+
     fn handle_key(&mut self, key: KeyEvent) {
         if self.editing_filter {
             self.handle_filter_key(key);
             return;
         }
+        // A keypress clears any transient notice from the previous one.
+        self.status = None;
         match self.mode {
             Mode::List => self.handle_list_key(key),
             Mode::Browse => self.handle_browse_key(key),
@@ -531,6 +568,7 @@ impl App {
                 self.recompute_view();
             }
             KeyCode::Char('/') => self.editing_filter = true,
+            KeyCode::Char('o') => self.resume_current(),
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
                 if let Some(&i) = self.view.get(self.selected) {
                     self.open_detail(i, Mode::List);
@@ -553,6 +591,7 @@ impl App {
             KeyCode::End | KeyCode::Char('G') => self.bsel = self.move_cursor(isize::MAX, len),
             KeyCode::Char('s') => self.sort = self.sort.next(),
             KeyCode::Char('/') => self.editing_filter = true,
+            KeyCode::Char('o') => self.resume_current(),
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => self.activate_browse_entry(),
             KeyCode::Backspace | KeyCode::Char('h') | KeyCode::Left => self.ascend_browse(),
             _ => {}
@@ -565,6 +604,7 @@ impl App {
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Char('t') | KeyCode::Right => self.open_transcript(),
             // Back: to whichever view opened the detail.
             KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left => self.mode = self.detail_return,
+            KeyCode::Char('o') => self.resume_current(),
             KeyCode::Down | KeyCode::Char('j') => self.detail_scroll = self.detail_scroll.saturating_add(1),
             KeyCode::Up | KeyCode::Char('k') => self.detail_scroll = self.detail_scroll.saturating_sub(1),
             KeyCode::PageDown => self.detail_scroll = self.detail_scroll.saturating_add(15),
@@ -584,6 +624,7 @@ impl App {
         match key.code {
             // Back up to Detail (q here is "up a level", not quit).
             KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left => self.mode = Mode::Detail,
+            KeyCode::Char('o') => self.resume_current(),
             KeyCode::Down | KeyCode::Char('j') => self.transcript_scroll = self.transcript_scroll.saturating_add(1).min(hard_max),
             KeyCode::Up | KeyCode::Char('k') => self.transcript_scroll = self.transcript_scroll.saturating_sub(1),
             KeyCode::PageDown => self.transcript_scroll = self.transcript_scroll.saturating_add(page).min(hard_max),
@@ -617,16 +658,22 @@ fn matches(s: &Session, needle: &str) -> bool {
 // Run loop + rendering
 // ---------------------------------------------------------------------------
 
-pub fn run(app: App) -> std::io::Result<()> {
+pub fn run(mut app: App) -> std::io::Result<()> {
     let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, app);
+    let result = event_loop(&mut terminal, &mut app);
     ratatui::restore();
-    result
+    result?;
+    // If the user asked to open a session, hand off now that the terminal is
+    // back to normal. exec replaces this process and only returns on failure.
+    if let Some(spec) = app.pending_launch.take() {
+        exec_resume(spec);
+    }
+    Ok(())
 }
 
-fn event_loop(terminal: &mut DefaultTerminal, mut app: App) -> std::io::Result<()> {
+fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
     while !app.should_quit {
-        terminal.draw(|frame| draw(frame, &mut app))?;
+        terminal.draw(|frame| draw(frame, app))?;
         if let Event::Key(key) = event::read()? {
             if key.kind == KeyEventKind::Press {
                 app.handle_key(key);
@@ -634,6 +681,20 @@ fn event_loop(terminal: &mut DefaultTerminal, mut app: App) -> std::io::Result<(
         }
     }
     Ok(())
+}
+
+/// Replace the ssft process with the harness's resume command. Returns only if
+/// exec fails (e.g. the harness binary isn't on PATH).
+fn exec_resume(spec: ResumeSpec) {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = std::process::Command::new(&spec.program);
+    cmd.args(&spec.args);
+    if let Some(cwd) = &spec.cwd {
+        cmd.current_dir(cwd);
+    }
+    let err = cmd.exec(); // on success, never returns
+    eprintln!("ssft: could not launch `{} {}`: {err}", spec.program, spec.args.join(" "));
+    std::process::exit(127);
 }
 
 const COLOR_ACCENT: Color = Color::Cyan;
@@ -668,12 +729,17 @@ fn header_line(app: &App, mode_label: &str, extra: String) -> Line<'static> {
 }
 
 fn footer_line(app: &App, hint: &str) -> Line<'static> {
-    let text = if app.editing_filter {
-        " type to filter  ·  Enter: keep  ·  Esc: clear".to_string()
-    } else {
-        hint.to_string()
-    };
-    Line::from(Span::styled(text, Style::default().fg(Color::DarkGray)))
+    if app.editing_filter {
+        return Line::from(Span::styled(
+            " type to filter  ·  Enter: keep  ·  Esc: clear",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    // A transient notice takes the footer over the hint until the next keypress.
+    if let Some(status) = &app.status {
+        return Line::from(Span::styled(format!(" {status}"), Style::default().fg(Color::Yellow)));
+    }
+    Line::from(Span::styled(hint.to_string(), Style::default().fg(Color::DarkGray)))
 }
 
 fn table_widths() -> [Constraint; 7] {
@@ -738,7 +804,7 @@ fn draw_list(frame: &mut Frame, app: &mut App) {
     frame.render_stateful_widget(table, body, &mut state);
 
     frame.render_widget(
-        footer_line(app, " ↑↓/jk move · Enter: detail · s: sort · /: filter · Tab: tree · q: quit"),
+        footer_line(app, " ↑↓/jk move · Enter: detail · o: resume · s: sort · /: filter · Tab: tree · q: quit"),
         footer,
     );
 }
@@ -831,7 +897,7 @@ fn draw_browse(frame: &mut Frame, app: &mut App) {
     frame.render_stateful_widget(table, body, &mut state);
 
     frame.render_widget(
-        footer_line(app, " ↑↓/jk move · Enter/→: open · ←/h/Bksp: up · s: sort · /: filter · Tab: flat · q: quit"),
+        footer_line(app, " ↑↓/jk move · Enter/→: open · o: resume · ←/h/Bksp: up · s: sort · /: filter · Tab: flat · q: quit"),
         footer,
     );
 }
@@ -852,7 +918,7 @@ fn draw_detail(frame: &mut Frame, app: &mut App) {
     frame.render_widget(para, body);
 
     frame.render_widget(
-        footer_line(app, " ↑↓/jk scroll · Enter/→/t: transcript · Esc/h/←: back · q: back"),
+        footer_line(app, " ↑↓/jk scroll · Enter/→/t: transcript · o: resume · Esc/h/←: back"),
         footer,
     );
 }
@@ -901,7 +967,7 @@ fn draw_transcript(frame: &mut Frame, app: &mut App) {
     frame.render_widget(para, body);
 
     frame.render_widget(
-        footer_line(app, " ↑↓/jk scroll · PgUp/PgDn · g/G top/bottom · Esc/h/←: back"),
+        footer_line(app, " ↑↓/jk scroll · g/G top/bottom · o: resume · Esc/h/←: back"),
         footer,
     );
 }

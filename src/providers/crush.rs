@@ -355,4 +355,11 @@ mod tests {
         assert!(matches!(msgs[1].blocks[1], Block::Text(_)));
         assert!(matches!(msgs[1].blocks[2], Block::ToolUse { ref name, .. } if name == "edit"));
     }
+
+    #[test]
+    fn resume_unsupported_by_default() {
+        // Crush doesn't override resume_command yet, so it opts out.
+        let s = Session::new("crush", "s1");
+        assert!(Crush::new().resume_command(&s).is_none());
+    }
 }

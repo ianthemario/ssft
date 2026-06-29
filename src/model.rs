@@ -136,6 +136,17 @@ pub struct Message {
     pub blocks: Vec<Block>,
 }
 
+/// How to launch a harness to resume a session. Returned by
+/// [`Provider::resume_command`]; the UI restores the terminal and execs it.
+#[derive(Debug, Clone)]
+pub struct ResumeSpec {
+    pub program: String,
+    pub args: Vec<String>,
+    /// Directory to run in - usually the session's workspace, since harnesses
+    /// scope sessions by project directory.
+    pub cwd: Option<String>,
+}
+
 /// The canonical, harness-agnostic view of one session. Rich fields are
 /// `Option` because most harnesses record fewer signals than Claude Code; the
 /// always-available fallbacks (`bytes`, `mtime`) keep triage working regardless.
@@ -262,4 +273,10 @@ pub trait Provider {
     /// lazily when the user drills in, so message bodies are never held for
     /// every session at once.
     fn transcript(&self, session_ref: &SessionRef) -> Result<Vec<Message>>;
+
+    /// How to resume this session in its harness from the CLI, or `None` if the
+    /// harness doesn't support it. Default: not supported - providers opt in.
+    fn resume_command(&self, _session: &Session) -> Option<ResumeSpec> {
+        None
+    }
 }
